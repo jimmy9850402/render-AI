@@ -2,92 +2,87 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import yfinance as yf
 import pandas as pd
+import requests
+import os
 from supabase import create_client
-import urllib3
 
-# 1. 初始化連線 (請確保在 Render 的 Environment Variables 設定這些值)
-SUPABASE_URL = "https://cemnzictjgunjyktrruc.supabase.co"
-SUPABASE_KEY = "您的_SUPABASE_KEY" #
+app = FastAPI(title="Fubon Insurance - Resilient D&O Engine")
+
+# 1. 安全初始化：從 Render 環境變數讀取
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-app = FastAPI(title="Fubon Insurance - Precision Engine v5.0")
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# 2. 建立偽裝 Session，避免被 Yahoo 封鎖
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+})
 
 def find_stock_code(query):
-    """移植您的 Supabase 名稱轉換邏輯"""
+    """移植您的 Supabase 邏輯，並加入模糊容錯"""
     if query.isdigit(): return f"{query}.TW"
     try:
         res = supabase.table("stock_isin_list").select("code, name").ilike("name", f"%{query}%").execute()
         if res.data:
+            # 優先回傳完全符合的名字，否則回傳第一個搜尋結果
             for item in res.data:
                 if item['name'] == query: return f"{item['code']}.TW"
             return f"{res.data[0]['code']}.TW"
     except: return None
 
-def safe_get(df, index_name, col):
-    """移植您的精確標籤檢索邏輯"""
-    try:
-        if index_name in df.index:
-            val = df.loc[index_name, col]
-            # 處理可能回傳 Series 的情況
-            return float(val.iloc[0] if hasattr(val, 'iloc') else val)
-        return 0
-    except: return 0
-
 @app.post("/analyze")
 async def analyze(request: Request):
     try:
         body = await request.json()
-        query = str(body.get("company", "2330")).strip()
-        
-        # 1. 執行標的代碼轉換 (解決「打富邦金跑出台積電」的問題)
+        query = str(body.get("company", "")).strip()
         symbol = find_stock_code(query)
+        
         if not symbol:
-            return JSONResponse({"error": f"資料庫中查無「{query}」的公司代號"}, status_code=200)
+            return JSONResponse({"error": f"找不到「{query}」的公司代號"}, status_code=200)
 
-        # 2. 數據抓取 (比照 Streamlit 邏輯)
-        ticker = yf.Ticker(symbol)
+        # 3. 使用 Session 抓取數據，解決空值問題
+        ticker = yf.Ticker(symbol, session=session)
         q_inc = ticker.quarterly_financials
         q_bal = ticker.quarterly_balance_sheet
-        q_cf = ticker.quarterly_cashflow
 
-        if q_inc.empty:
-            return JSONResponse({"error": "yf 抓取空值，請確認 Yahoo Finance 標記"}, status_code=200)
+        # 基礎防護：如果真的還是抓不到，回傳詳細錯誤供 Debug
+        if q_inc is None or q_inc.empty:
+            return JSONResponse({"error": f"yf 無法抓取 {symbol}。原因：Yahoo 伺服器拒絕連線或標籤格式更新。"}, status_code=200)
 
-        # 3. 建立財務表格 (單位：千元，比照您 989B 的校準邏輯)
+        # 4. 財務指標處理 (單位：千元)
         table_rows = []
         for col in q_inc.columns[:4]:
             label = f"{col.year - 1911}年 Q{((col.month-1)//3)+1}"
             
-            # 依照您的 safe_get 邏輯抓取，並除以 1000 轉換為「千元」
-            rev = safe_get(q_inc, "Total Revenue", col) / 1000
-            assets = safe_get(q_bal, "Total Assets", col) / 1000
-            liab = safe_get(q_bal, "Total Liabilities Net Minority Interest", col) / 1000
-            if liab == 0: liab = safe_get(q_bal, "Total Liab", col) / 1000
-            ca = safe_get(q_bal, "Current Assets", col) / 1000
-            cl = safe_get(q_bal, "Current Liabilities", col) / 1000
-            eps = safe_get(q_inc, "Basic EPS", col)
-            
+            # 使用您 Streamlit 的精確標籤邏輯
+            def get_f(df, key): 
+                try: return float(df.loc[key, col]) / 1000
+                except: return 0
+
+            rev = get_f(q_inc, "Total Revenue")
+            assets = get_f(q_bal, "Total Assets")
+            liab = get_f(q_bal, "Total Liabilities Net Minority Interest")
+            if liab == 0: liab = get_f(q_bal, "Total Liab")
+            eps = get_f(q_inc, "Basic EPS") * 1000 # EPS 不除 1000
+
             dr = (liab / assets) if assets > 0 else 0
             
             table_rows.append({
                 "p": label, "rev": f"{rev:,.0f}", "assets": f"{assets:,.0f}",
-                "dr": f"{dr:.2%}", "ca": f"{ca:,.0f}", "cl": f"{cl:,.0f}", "eps": f"{eps:.2f}"
+                "dr": f"{dr:.2%}", "eps": f"{eps:.22f}" # EPS 保留兩位
             })
 
-        # 4. 判定與結論
-        latest = table_rows[0]
-        rev_val = float(latest['rev'].replace(',', ''))
-        dr_val = float(latest['dr'].strip('%'))
+        # 5. D&O Group A 判定標籤
+        latest_rev = float(table_rows[0]['rev'].replace(',', ''))
+        is_group_a = (latest_rev >= 15000000) and (not (2800 <= int(symbol[:4]) <= 2899))
         
-        is_group_a = (rev_val >= 15000000) and (dr_val < 80) and (float(latest['eps']) > 0)
-
         return {
             "header": f"【D&O 核保分析 - {query} ({symbol})】",
             "table": table_rows,
             "conclusion": "✅ 符合 Group A" if is_group_a else "⚠️ 建議由總公司核決人員評估。",
-            "source": "📊 數據源：yfinance 實時抓取 (同步您的 Streamlit 邏輯)"
+            "source": "📊 數據源：yfinance 實時抓取 (已執行連線優化)"
         }
 
     except Exception as e:
-        return JSONResponse({"error": f"系統異常：{str(e)}"}, status_code=200)
+        return JSONResponse({"error": f"邏輯異常：{str(e)}"}, status_code=200)

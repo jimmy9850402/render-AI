@@ -1,6 +1,5 @@
-fastapi
-uvicorn[standard]
-requests
-yfinance
-pandas
-lxml
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+yfinance==0.2.40
+pandas==2.2.0
+requests==2.31.0

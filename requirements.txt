@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
-requests
 yfinance
 pandas
 lxml
+requests
+urllib3
